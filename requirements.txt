@@ -1,0 +1,9 @@
+yt-dlp
+faster-whisper
+edge-tts
+deep-translator
+pydub
+requests
+gTTS
+playwright
+flask
