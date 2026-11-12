@@ -5,3 +5,11 @@ config.json
 .browser-profile/
 .pw-browsers/
 .env*
+profile/
+_resume/
+.vieneu-venv/
+.chat2api/
+*.lnk
+.models/
+.tmp/
+series/

@@ -7,3 +7,5 @@ requests
 gTTS
 playwright
 flask
+Pillow
+numpy

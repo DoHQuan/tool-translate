@@ -241,11 +241,24 @@ def download_douyin_direct(url, out_path):
 
 
 def download_ytdlp(url, out_path, cookies_browser=None):
-    cmd = [sys.executable, "-m", "yt_dlp", "-f", "mp4/best", "-o", str(out_path), "--no-playlist", "--force-overwrites"]
+    """Tải bằng yt-dlp. Bilibili / YouTube để hình và tiếng ở hai luồng riêng: phải tải CẢ HAI rồi ghép
+    (định dạng cũ "mp4/best" chọn trúng luồng chỉ có hình -> video tải về không có tiếng)."""
+    cmd = [sys.executable, "-m", "yt_dlp", "-f", "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b", "--merge-output-format", "mp4",
+           "-o", str(out_path), "--no-playlist", "--force-overwrites", "--print", "after_move:title", "--no-simulate",
+           "--encoding", "utf-8"]
     if cookies_browser:
         cmd += ["--cookies-from-browser", cookies_browser]
-    run(cmd + [url])
-    return ""
+    r = subprocess.run(cmd + [url], capture_output=True, text=True, encoding="utf-8", errors="replace",
+                       env=dict(os.environ, PYTHONIOENCODING="utf-8"))
+    if r.returncode != 0:
+        raise RuntimeError(f"yt-dlp lỗi: {r.stderr[-800:]}")
+    out = r.stdout
+    if not has_audio(out_path):
+        raise RuntimeError("Video tải về không có tiếng (nguồn chỉ cho tải hình). Hãy thử link khác.")
+    lines = [x.strip() for x in out.splitlines() if x.strip()]
+    if lines:
+        log(f"Tiêu đề: {lines[-1]}")
+    return lines[-1] if lines else ""
 
 
 def download(src, workdir, cookies_browser=None):
@@ -278,13 +291,43 @@ def download(src, workdir, cookies_browser=None):
         else:
             raise RuntimeError(f"Không tải được video Douyin. Kiểm tra link còn xem được không rồi thử lại. ({errors[0]})")
     else:
-        download_ytdlp(url, out, cookies_browser)
+        title = download_ytdlp(url, out, cookies_browser) or ""
     log(f"Đã tải xong ({os.path.getsize(out) / 1e6:.1f} MB)")
     return out, title
 
 
 # ------------------------------------------------------------ 2. Transcribe
-def transcribe(video, workdir, model_name, lang, hint=""):
+def eleven_stt(wav, lang):
+    """Nghe bằng ElevenLabs Scribe (đám mây): nhanh hơn nhiều so với chạy trên máy, tính credit ElevenLabs.
+    Trả về các đoạn có cùng dạng với Whisper (start, end, text, words[start, end, word]) để xử lý tiếp như cũ."""
+    from types import SimpleNamespace
+
+    import eleven_tts
+
+    kc = eleven_tts.load_config()
+    if not kc:
+        raise RuntimeError("chưa có API key ElevenLabs")
+    with open(wav, "rb") as f:
+        r = requests.post("https://api.elevenlabs.io/v1/speech-to-text", headers={"xi-api-key": kc["key"]},
+                          data={"model_id": "scribe_v1", "language_code": {"zh": "zho"}.get(lang, lang),
+                                "timestamps_granularity": "word", "tag_audio_events": "false"},
+                          files={"file": ("audio.wav", f, "audio/wav")}, timeout=600)
+    if r.status_code != 200:
+        raise RuntimeError(f"ElevenLabs từ chối ({r.status_code}): {eleven_tts._err(r)[:200]}")
+    words = [SimpleNamespace(word=w.get("text", ""), start=float(w.get("start", 0)), end=float(w.get("end", 0)))
+             for w in r.json().get("words", []) if w.get("type") == "word" and str(w.get("text", "")).strip()]
+    segs, cur = [], []
+    for w in words:  # chia thành đoạn ở chỗ ngừng dài; tách câu chi tiết làm ở split_by_words như với Whisper
+        if cur and w.start - cur[-1].end > 1.2:
+            segs.append(cur)
+            cur = []
+        cur.append(w)
+    if cur:
+        segs.append(cur)
+    return [SimpleNamespace(start=g[0].start, end=g[-1].end, text="".join(x.word for x in g), words=g) for g in segs]
+
+
+def transcribe(video, workdir, model_name, lang, hint="", engine="local", beam=2):
     from faster_whisper import WhisperModel
 
     wav = workdir / "audio16k.wav"  # bản gốc (dùng để đo cao độ giọng)
@@ -293,10 +336,24 @@ def transcribe(video, workdir, model_name, lang, hint=""):
     PAD = 1.0
     wav_pad = workdir / "audio16k_pad.wav"
     run(["ffmpeg", "-y", "-i", str(wav), "-af", f"adelay={int(PAD * 1000)}", "-ac", "1", "-ar", "16000", str(wav_pad)])
-    log(f"Nhận dạng giọng nói (model {model_name}, lần đầu sẽ tải model)...")
-    model = WhisperModel(model_name, device="auto", compute_type="int8")
+    segments = None
+    if engine == "eleven":
+        log("Nhận dạng giọng nói qua đám mây (ElevenLabs)...")
+        try:
+            segments = eleven_stt(wav_pad, lang)
+        except Exception as e:
+            log(f"Không nghe được qua đám mây ({str(e)[:160]}) -> nghe trên máy")
+    if segments is None:
+        log(f"Nhận dạng giọng nói (model {model_name}, lần đầu sẽ tải model)...")
+        model = WhisperModel(model_name, device="auto", compute_type="int8")
+        segments = whisper_segments(model, wav_pad, lang, beam)
+    segs = _collect_segments(segments, hint)
+    return _finish_transcribe(segs, wav)
+
+
+def whisper_segments(model, wav_pad, lang, beam=5):
     segments, info = model.transcribe(
-        str(wav_pad), language=lang, vad_filter=True, beam_size=5,
+        str(wav_pad), language=lang, vad_filter=True, beam_size=beam,
         # VAD nhạy hơn mặc định: giọng trẻ con / nói nhỏ trên nền nhạc hay bị cắt mất
         # (0.1 bắt được cả tiếng gọi ngắn như "小姑"; câu ảo giác sinh ra từ nhạc nền được lọc bằng HALLUCINATIONS)
         vad_parameters={"min_silence_duration_ms": 400, "threshold": 0.1, "speech_pad_ms": 500},
@@ -307,6 +364,11 @@ def transcribe(video, workdir, model_name, lang, hint=""):
         # làm hỏng cả đoạn. Chữ nghe nhầm đã có bước dịch AI sửa theo ngữ cảnh.
         initial_prompt="以下是普通话的句子，使用简体中文。" if lang == "zh" else None,
     )
+    return segments
+
+
+def _collect_segments(segments, hint=""):
+    PAD = 1.0
     title_norm = _norm(re.sub(r"#\S+", "", hint or ""))
     segs = []
     for s in segments:
@@ -321,6 +383,10 @@ def transcribe(video, workdir, model_name, lang, hint=""):
                 continue
             segs.append(line)
             print(f"   {line['start']:6.1f}s  {line['zh']}", flush=True)
+    return segs
+
+
+def _finish_transcribe(segs, wav):
     n0 = len(segs)
     # cao độ giọng từng câu: để không gộp nhầm lời của 2 người khác nhau thành 1 câu
     import wave
@@ -540,7 +606,67 @@ AI_DEFAULT_MODELS = {
     "claude": "claude-haiku-5-5",
     "openai": "gpt-4o-mini",
     "deepseek": "deepseek-chat",
+    "chat2api": "gpt-4o",
 }
+# Giọng có sẵn của VieNeu-TTS (đọc ngay trên máy, miễn phí): theo giới tính, xếp sẵn thứ tự ưu tiên
+VIENEU_VOICES = {
+    "male": ['Hải Đăng', 'Thiện Minh', 'Thanh Bình', 'Minh Đức', 'Phạm Tuyên', 'Xuân Vĩnh', 'Quốc Tuấn', 'Thiền Tâm Đức', 'Adam bựa', 'Quang Sơn', 'Thái Sơn', 'Minh Triết', 'Đức Trí', 'Adam'],
+    "female": ['Trúc Ly', 'Ngọc Huyền', 'Mai Anh', 'Ngọc Linh', 'Đoan Trang', 'Quỳnh Anh', 'Ngọc Trân', 'Thùy Dung', 'Thục Đoan', 'Mỹ Duyên', 'Kim Thanh'],
+}
+# Ưu tiên theo tuổi (xếp theo nhãn phong cách của từng giọng; VieNeu không có giọng trẻ con -> dùng giọng nữ trẻ)
+VIENEU_BY_AGE = {
+    ("male", "child"): ["Quỳnh Anh", "Đoan Trang", "Trúc Ly"],
+    ("female", "child"): ["Quỳnh Anh", "Đoan Trang", "Trúc Ly"],
+    ("male", "young"): ["Hải Đăng", "Phạm Tuyên", "Xuân Vĩnh", "Quốc Tuấn", "Adam", "Đức Trí"],
+    ("male", "adult"): ["Thiện Minh", "Thanh Bình", "Minh Đức", "Thái Sơn", "Minh Triết", "Quang Sơn"],
+    ("male", "old"): ["Thiền Tâm Đức", "Thanh Bình", "Thái Sơn"],
+    ("female", "young"): ["Trúc Ly", "Đoan Trang", "Quỳnh Anh", "Mỹ Duyên", "Ngọc Trân"],
+    ("female", "adult"): ["Ngọc Huyền", "Mai Anh", "Ngọc Linh", "Thùy Dung", "Thục Đoan", "Kim Thanh"],
+    ("female", "old"): ["Ngọc Linh", "Thục Đoan", "Kim Thanh"],
+}
+
+
+def vieneu_pick(vkey, taken):
+    """Chọn giọng VieNeu cho một nhân vật (giới tính, tuổi, thứ tự): hợp tuổi trước, rồi cùng giới tính, và chưa
+    nhân vật nào dùng. Hết giọng trống thì xoay vòng trong nhóm cùng giới tính."""
+    gender = "male" if vkey[0] == "male" else "female"
+    age = vkey[1] if len(vkey) > 1 else "adult"
+    pool = list(VIENEU_BY_AGE.get((gender, age), [])) + VIENEU_VOICES["female" if age == "child" else gender]
+    pool = list(dict.fromkeys(pool))
+    for name in pool:
+        if name not in taken:
+            return name
+    return pool[len(taken) % len(pool)]
+
+
+VIENEU_PY = Path(__file__).resolve().parent / ".vieneu-venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+
+
+def vieneu_speak_all(items):
+    """items: list (text, out_wav, tên giọng). Gọi vieneu_worker.py trong môi trường riêng. Trả về tập chỉ số đã đọc được."""
+    if not items:
+        return set()
+    jobs = Path(items[0][1]).parent / "vieneu_jobs.json"
+    jobs.write_text(json.dumps([{"text": t, "out": str(o), "voice": v} for t, o, v in items], ensure_ascii=False),
+                    encoding="utf-8")
+    for _, o, _ in items:
+        Path(o).unlink(missing_ok=True)
+    p = subprocess.Popen([str(VIENEU_PY), "-u", str(Path(__file__).resolve().parent / "vieneu_worker.py"), str(jobs)],
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
+                         env=dict(os.environ, PYTHONIOENCODING="utf-8", HF_HUB_DISABLE_SYMLINKS_WARNING="1"))
+    tail = []
+    for line in p.stdout:
+        line = line.rstrip()
+        if re.match(r"\s*\d+/\d+\s*$", line) or line.startswith("[vieneu]"):
+            print(line, flush=True)
+        elif line.strip():
+            tail = (tail + [line])[-3:]
+    if p.wait() != 0:
+        log(f"VieNeu lỗi: {' | '.join(tail)[:200]}")
+    return {n for n, (_, o, _) in enumerate(items) if Path(o).is_file() and Path(o).stat().st_size > 2000}
+
+
+EL_SYLLABLES_PER_SEC = 3.8  # ElevenLabs đọc tiếng Việt chậm hơn Edge
 VI_SYLLABLES_PER_SEC = 4.6  # tốc độ đọc thoải mái của giọng Edge TTS tiếng Việt (~x1.15)
 
 
@@ -554,24 +680,46 @@ def load_ai_config():
     provider = os.environ.get("DUB_AI_PROVIDER") or cfg.get("ai_provider") or ""
     key = os.environ.get("DUB_AI_KEY") or cfg.get("ai_key") or ""
     model = os.environ.get("DUB_AI_MODEL") or cfg.get("ai_model") or AI_DEFAULT_MODELS.get(provider, "")
-    if provider in AI_DEFAULT_MODELS and len(key) > 10:
+    if provider == "chat2api" and key.strip():
+        base = os.environ.get("DUB_AI_BASE_URL") or cfg.get("ai_base_url") or "http://127.0.0.1:5005/v1"
+        return {"provider": provider, "key": key, "model": model, "base_url": normalize_chat2api_url(base)}
+    if provider in AI_DEFAULT_MODELS and provider != "chat2api" and len(key) > 10:
         return {"provider": provider, "key": key, "model": model}
     return None
+
+
+def normalize_chat2api_url(value):
+    from urllib.parse import urlsplit
+
+    base = str(value).strip().rstrip("/")
+    parsed = urlsplit(base)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError("Địa chỉ chat2api phải là URL http/https, không chứa token, query hoặc mật khẩu.")
+    if base.endswith("/chat/completions"):
+        base = base[:-len("/chat/completions")]
+    if not base.endswith("/v1"):
+        base += "/v1"
+    return base
 
 
 GEMINI_FALLBACKS = ["gemini-3.5-flash", "gemini-flash-latest", "gemini-flash-lite-latest"]
 
 
-def ai_chat(cfg, system, user, timeout=90):
+def ai_chat(cfg, system, user, timeout=90, strong_only=False):
     """Gọi LLM, trả về chuỗi JSON. Với Gemini: model đang quá tải / treo / không có -> tự chuyển model khác
     và nhớ model chạy được cho các lần gọi sau."""
     models = [cfg["model"]]
     if cfg["provider"] == "gemini":  # model đang dùng trước, quá tải thì xoay sang model khác (mỗi lần gọi)
         models += [m for m in GEMINI_FALLBACKS if m != cfg["model"]]
+    if strong_only:  # việc cần suy luận kỹ (sửa lời nghe nhầm): model "lite" làm sai nhiều hơn đúng -> thà bỏ qua
+        models = [m for m in models if "lite" not in m]
+        if not models:
+            raise RuntimeError("không có model đủ mạnh")
+        cfg = dict(cfg)  # không đổi model đang dùng của các bước khác
     import time
 
     last = None
-    for wait in (0, 10, 30):  # mọi model đều quá tải -> chờ rồi thử lại cả vòng
+    for wait in ((0, 10) if strong_only else (0, 10, 30)):  # mọi model đều quá tải -> chờ rồi thử lại cả vòng
         if wait:
             log(f"AI đang quá tải, chờ {wait} giây rồi thử lại...")
             time.sleep(wait)
@@ -617,9 +765,15 @@ def _ai_call(cfg, system, user, timeout):
         r.raise_for_status()
         return "".join(b.get("text", "") for b in r.json()["content"] if b.get("type") == "text")
     url = "https://api.deepseek.com/chat/completions" if p == "deepseek" else "https://api.openai.com/v1/chat/completions"
+    payload = {"model": model, "temperature": 0.3,
+               "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
+    if p == "chat2api":
+        url = normalize_chat2api_url(cfg.get("base_url") or "http://127.0.0.1:5005/v1") + "/chat/completions"
+        payload["stream"] = False
+    else:
+        payload["response_format"] = {"type": "json_object"}
     r = requests.post(url, timeout=timeout, headers={"Authorization": f"Bearer {key}"},
-                      json={"model": model, "temperature": 0.3, "response_format": {"type": "json_object"},
-                            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]})
+                      json=payload)
     r.raise_for_status()
     return r.json()["choices"][0]["message"]["content"]
 
@@ -639,7 +793,18 @@ Yêu cầu:
 - Tên người đọc theo Hán-Việt ĐÚNG TỪNG CHỮ (明哥 -> anh Minh, 阿南 -> A Nam, 王婶 -> thím Vương, 苏 -> Tô, 顾 -> Cố).
   Không để phiên âm pinyin. Câu có gọi tên ai thì giữ tên đó.
 - Giờ giấc: X点一刻 = X giờ mười lăm, X点半 = X giờ rưỡi, X点三刻 = X giờ bốn lăm, 差一刻X点 = X giờ kém mười lăm.
-- MỖI CÂU PHẢI ĐỌC KỊP trong thời gian cho phép: không vượt quá số âm tiết "max" của câu đó. Câu dài thì rút gọn, giữ ý chính.
+- MỖI CÂU PHẢI ĐỌC KỊP trong thời gian cho phép: không vượt quá số âm tiết "max" của câu đó. Khi phải rút gọn thì bỏ
+  từ đệm, từ lặp, lời rào đón trước; KHÔNG bỏ tên riêng, địa danh, con số, đơn vị, tên món ăn / đồ vật, và không biến
+  câu hỏi thành câu khẳng định.
+- Thành ngữ, tục ngữ, câu đùa, chơi chữ, tiếng lóng mạng, từ game (掉血 = tụt máu, debuff, 副本 = phó bản / ải,
+  开荒 = khai hoang server mới...): dịch THOÁT Ý sang cách nói tiếng Việt tương đương để người Việt hiểu ngay và vẫn
+  thấy buồn cười; không dịch từng chữ. VD 放马过来 = "cứ mang hết ra đây"; 面朝黄土背朝天 = "bán mặt cho đất bán lưng
+  cho trời"; 老天爷追着喂饭 = "ông trời đút cơm tận miệng". Chơi chữ không dịch được thì giữ ý gây cười.
+- Triều đại, địa danh đọc Hán-Việt chuẩn, viết đúng chính tả: 民国 / 民初 = Dân quốc / đầu Dân quốc (KHÔNG phải nhà Minh),
+  清末 = cuối Thanh, 哈尔滨 = Cáp Nhĩ Tân, 东北 = Đông Bắc, 山东 = Sơn Đông, 河北 = Hà Bắc. Không chêm chữ cái lạ vào từ.
+- Đơn vị: 两 = lạng, 斤 = cân (nửa ký), 公斤 = ký, 里 = dặm, 亩 = mẫu. Số đếm giữ nguyên giá trị.
+- Một câu nói bị ngắt thành nhiều dòng liên tiếp: dịch sao cho các dòng nối lại thành câu tiếng Việt trọn nghĩa,
+  không để dòng nào cụt lủn giữa chừng (vd "ăn no chính là").
 - Giữ nguyên số câu và thứ tự; không gộp, không tách câu. Câu chỉ là tiếng cảm thán/vô nghĩa thì dịch ngắn gọn.
 - Nếu có BẢNG NHÂN VẬT & XƯNG HÔ: mỗi câu đã ghi người nói ("who") và người nghe ("to").
   PHẢI dùng ĐÚNG cặp xưng hô trong bảng cho cặp người nói -> người nghe đó, giống nhau ở MỌI câu
@@ -674,6 +839,39 @@ có thể sai chữ đồng âm) và lập hồ sơ để dịch + lồng tiến
 Chỉ trả về JSON: {"characters": [...], "address": [...], "lines": [{"i": 0, "who": "c1", "to": "c2", "emo": "calm"}]}"""
 
 
+AI_FIX = """Dưới đây là lời thoại tiếng Trung do máy nhận dạng giọng nói (ASR) chép lại từ một video. Máy hay chép SAI
+chữ đồng âm / gần âm, nhất là tên riêng, thành ngữ, tục ngữ, tiếng lóng, từ tiếng Anh và từ game
+(vd 眼睛飞到饭锅里 thật ra là 野鸡飞到饭锅里; 小心蘑菇 thật ra là 小鸡炖蘑菇; 美丽洞人 thật ra là 美丽冻人;
+持续调解的寒冷地吧 thật ra là 持续掉血的寒冷debuff; 共和国掌务 thật ra là 共和国长子).
+Hãy đọc TOÀN BỘ để hiểu ngữ cảnh rồi sửa lại những câu bị chép sai cho đúng chữ người nói thật sự đã nói.
+- Chỉ sửa chữ sai do nghe nhầm; KHÔNG viết lại, không thêm ý, không gộp / tách câu, giữ độ dài gần như cũ.
+- Câu nào đã đúng hoặc bạn không chắc thì BỎ QUA, không đưa vào kết quả.
+Chỉ trả về JSON: {"lines": [{"i": <số>, "zh": "<câu đã sửa>"}]} gồm RIÊNG các câu có sửa (không có câu nào thì "lines": [])."""
+
+
+def ai_fix_asr(segs, cfg, title, chunk=150):
+    """Nhờ AI sửa các câu tiếng Trung máy nghe nhầm (dựa vào ngữ cảnh) trước khi dịch. Trả về số câu đã sửa."""
+    clean_title = re.sub(r"#\S+", "", title or "").strip() or "(không rõ)"
+    fixed = 0
+    for c0 in range(0, len(segs), chunk):
+        idx = range(c0, min(c0 + chunk, len(segs)))
+        user = f"Tên video: {clean_title}\n" + json.dumps([{"i": i, "zh": segs[i]["zh"]} for i in idx], ensure_ascii=False)
+        res = _parse_json(ai_chat(cfg, AI_FIX, user, strong_only=True)).get("lines") or []
+        for x in res:
+            try:
+                i, new = int(x["i"]), str(x["zh"]).strip()
+            except Exception:
+                continue
+            old = segs[i]["zh"] if i in idx else ""
+            # chỉ nhận sửa đổi nhỏ: độ dài gần như cũ, không phải viết lại cả câu
+            if old and new and new != old and 0.6 <= len(new) / max(1, len(old)) <= 1.6:
+                segs[i]["zh_raw"], segs[i]["zh"] = old, new
+                fixed += 1
+                if fixed <= 6:
+                    print(f"      {old}  ->  {new}", flush=True)
+    return fixed
+
+
 def _pitch_label(f0):
     if not f0:
         return ""
@@ -703,10 +901,11 @@ def fix_speakers(segs, chars):
         log(f"  {n} câu đổi người nói theo giọng gốc (AI gán nhầm nam/nữ)")
 
 
-def ai_analyze(segs, cfg, title, chunk=150):
-    """AI xác định nhân vật, người nói từng câu và bảng xưng hô cố định. Trả về (characters, address)."""
+def ai_analyze(segs, cfg, title, chunk=150, seed=None):
+    """AI xác định nhân vật, người nói từng câu và bảng xưng hô cố định. Trả về (characters, address).
+    seed: (characters, address) của các tập trước cùng bộ phim -> giữ đúng tên, giới tính, xưng hô như cũ."""
     log("AI phân tích nhân vật, người nói và xưng hô...")
-    chars, address = [], []
+    chars, address = (list(seed[0]), list(seed[1])) if seed else ([], [])
     clean_title = re.sub(r"#\S+", "", title or "").strip() or "(không rõ)"
     for c0 in range(0, len(segs), chunk):
         idx = range(c0, min(c0 + chunk, len(segs)))
@@ -747,10 +946,69 @@ def ai_analyze(segs, cfg, title, chunk=150):
     return chars, address
 
 
+SERIES_DIR = Path(__file__).resolve().parent / "series"
+
+
+def series_file(name):
+    safe = re.sub(r"[^\w\- ]+", " ", name or "").strip()[:60]
+    return SERIES_DIR / f"{safe or 'phim'}.json"
+
+
+def load_series(name):
+    """Hồ sơ một bộ phim: nhân vật (tên, giới tính, tuổi), xưng hô theo TÊN, giọng đã dùng cho từng nhân vật."""
+    if not name:
+        return None
+    try:
+        d = json.loads(series_file(name).read_text(encoding="utf-8"))
+    except Exception:
+        d = {}
+    d.setdefault("name", name)
+    d.setdefault("characters", [])
+    d.setdefault("address", [])
+    d.setdefault("voices", {})
+    return d
+
+
+def save_series(series):
+    if series:
+        SERIES_DIR.mkdir(exist_ok=True)
+        series_file(series["name"]).write_text(json.dumps(series, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def series_seed(series):
+    """Hồ sơ phim -> (characters, address) dạng id để đưa vào bước phân tích như "hồ sơ đã có"."""
+    if not series or not series["characters"]:
+        return [], []
+    chars = [{"id": f"c{k + 1}", "name": c["name"], "gender": c.get("gender"), "age": c.get("age")}
+             for k, c in enumerate(series["characters"])]
+    ids = {c["name"]: c["id"] for c in chars}
+    address = [{"from": ids[a["from"]], "to": ids[a["to"]], "self": a.get("self"), "call": a.get("call")}
+               for a in series["address"] if a.get("from") in ids and a.get("to") in ids]
+    return chars, address
+
+
+def series_merge(series, chars, address):
+    """Thêm nhân vật / cặp xưng hô MỚI của tập này vào hồ sơ phim (cái đã có thì giữ nguyên như tập trước)."""
+    if not series:
+        return
+    names = {c["id"]: c["name"] for c in chars}
+    known = {c["name"] for c in series["characters"]}
+    for c in chars:
+        if c.get("name") and c["name"] not in known:
+            series["characters"].append({k: c.get(k) for k in ("name", "gender", "age")})
+            known.add(c["name"])
+    pairs = {(a["from"], a["to"]) for a in series["address"]}
+    for a in address:
+        f, t = names.get(a.get("from")), names.get(a.get("to"))
+        if f and t and (f, t) not in pairs:
+            series["address"].append({"from": f, "to": t, "self": a.get("self"), "call": a.get("call")})
+            pairs.add((f, t))
+
+
 def _budget(segs, i, total):
     nxt = segs[i + 1]["start"] if i + 1 < len(segs) else total
     avail = max(segs[i]["end"] - segs[i]["start"], min(nxt - segs[i]["start"], segs[i]["end"] - segs[i]["start"] + 1.5))
-    return max(3, int(avail * VI_SYLLABLES_PER_SEC))
+    return max(3, int(avail * VI_SYLLABLES_PER_SEC * 1.12))  # đọc nhanh nhẹ ~1,1x còn hơn cắt mất ý
 
 
 def ai_translate(segs, cfg, title, total, chunk=60, context=8, chars=None, address=None):
@@ -803,8 +1061,9 @@ def ai_translate(segs, cfg, title, total, chunk=60, context=8, chars=None, addre
 
 def ai_shorten(items, cfg):
     """items: list (zh, vi, max_syllables) -> list câu ngắn hơn."""
-    user = ("Các câu lồng tiếng sau quá dài so với thời gian nói. Viết lại NGẮN HƠN, giữ ý chính và giọng văn, "
-            "không vượt quá số âm tiết 'max':\n"
+    user = ("Các câu lồng tiếng sau quá dài so với thời gian nói. Viết lại NGẮN HƠN, không vượt quá số âm tiết 'max'. "
+            "Bỏ từ đệm, từ lặp, lời rào đón trước; GIỮ tên riêng, địa danh, con số, tên món / đồ vật và ý gây cười; "
+            "câu hỏi vẫn là câu hỏi; không để câu cụt lủn:\n"
             + json.dumps([{"i": k, "zh": z, "vi": v, "max": m} for k, (z, v, m) in enumerate(items)], ensure_ascii=False))
     res = {int(x["i"]): str(x["vi"]).strip() for x in _parse_json(ai_chat(cfg, AI_SYSTEM, user))["lines"]}
     return [res.get(k) or v for k, (z, v, m) in enumerate(items)]
@@ -837,13 +1096,23 @@ def enforce_address(segs, address):
         log(f"  Sửa xưng hô mày/tao theo bảng ở {fixed} câu")
 
 
-def translate(segs, src_lang, title="", total=0, ai_cfg=None):
+def translate(segs, src_lang, title="", total=0, ai_cfg=None, series=None):
     """Dịch; trả về (characters, address) nếu AI phân tích được nhân vật (dùng để chọn giọng)."""
     chars, address = [], []
     if ai_cfg:
         try:
-            chars, address = ai_analyze(segs, ai_cfg, title)
+            log("AI sửa lời tiếng Trung nghe nhầm theo ngữ cảnh...")
+            n = ai_fix_asr(segs, ai_cfg, title)
+            log(f"  Đã sửa {n} câu nghe nhầm" if n else "  Không có câu nào cần sửa")
+        except Exception as e:
+            log(f"  Bỏ qua bước sửa lời nghe nhầm (model mạnh không phản hồi: {str(e)[:80]}), dịch theo lời máy nghe")
+        try:
+            seed = series_seed(series)
+            if seed[0]:
+                log(f"Phim \"{series['name']}\": dùng lại {len(seed[0])} nhân vật và {len(seed[1])} cặp xưng hô của các tập trước")
+            chars, address = ai_analyze(segs, ai_cfg, title, seed=seed)
             fix_speakers(segs, chars)
+            series_merge(series, chars, address)
         except Exception as e:
             log(f"Không phân tích được nhân vật ({str(e)[:120]}), dịch không có bảng xưng hô")
         try:
@@ -856,10 +1125,12 @@ def translate(segs, src_lang, title="", total=0, ai_cfg=None):
             for s in segs:
                 who = names.get(s.get("who"), "")
                 print(f"   {s['start']:6.1f}s  {(who + ': ') if who else ''}{s['vi']}", flush=True)
+            globals()["LAST_TRANSLATOR"] = f"{ai_cfg['provider']}/{ai_cfg['model']}"
             return chars, address
         except Exception as e:
             log(f"Dịch bằng AI lỗi ({str(e)[:150]}) -> dùng Google Dịch")
     _google_translate(segs, src_lang)
+    globals()["LAST_TRANSLATOR"] = "google"
     return chars, address
 
 
@@ -1031,6 +1302,7 @@ def assign_voices(segs, chars, wav16k):
             spec, fixed = None, fixed + 1
         s["voice"] = spec or by_pitch(f0)
         s["vkey"] = vkey_of[s["who"]] if spec else key_by_pitch(f0)
+        s["wname"] = names.get(s.get("who"), "") if spec else ""
     if fixed:
         log(f"  {fixed} câu đổi giọng theo cao độ giọng gốc (AI đoán nhầm người nói)")
     for cid, (v, p, r) in spec_of.items():
@@ -1306,6 +1578,41 @@ def gemini_tts_all(items, key, state, max_lines=8, max_chars=360):
                 break
     return done
 
+def dub_estimate(segs, tts, el_model="v3"):
+    """Ước tính chi phí lồng tiếng trước khi đọc: số câu, số ký tự, credit ElevenLabs / lượt Gemini."""
+    import math
+
+    lines = [s["vi"].strip() for s in segs if s.get("vi", "").strip()]
+    est = {"tts": tts, "lines": len(lines), "chars": sum(len(x) for x in lines)}
+    if tts == "eleven":
+        est["model"] = el_model
+        est["credits"] = int(est["chars"] * (0.5 if el_model == "flash" else 1) * 1.08)  # +8% cho câu phải đọc lại
+        try:
+            import eleven_tts
+
+            kc = eleven_tts.load_config()
+            c = eleven_tts.credits(kc["key"]) if kc else None
+            if c and c[1]:
+                est["credits_left"] = int(c[1] - c[0])
+        except Exception:
+            pass
+    elif tts == "gemini":
+        est["calls"] = math.ceil(len(lines) / 8 * 1.3) + 1
+    return est
+
+
+def estimate_text(est):
+    if est["tts"] == "eleven":
+        left = f", tài khoản còn {est['credits_left']:,}".replace(",", ".") if "credits_left" in est else ""
+        return (f"{est['lines']} câu, {est['chars']:,} ký tự -> khoảng {est['credits']:,} credit ElevenLabs "
+                f"(model {est['model']})").replace(",", ".") + left
+    if est["tts"] == "gemini":
+        return f"{est['lines']} câu -> khoảng {est['calls']} lượt gọi giọng Gemini"
+    if est["tts"] == "vieneu":
+        return f"{est['lines']} câu, giọng VieNeu chạy trên máy (miễn phí, đọc mất khoảng {max(1, est['chars'] // 900)} phút)"
+    return f"{est['lines']} câu, giọng Edge miễn phí"
+
+
 def decode_pcm(path, tempo=None):
     """Giải mã audio thành mảng int16 mono 24 kHz (tuỳ chọn đọc nhanh hơn), bỏ khoảng lặng đầu/cuối."""
     import numpy as np
@@ -1329,7 +1636,7 @@ def has_audio(video):
 
 
 def dub(segs, video, workdir, voice, bg_volume, max_speed, ai_cfg=None, tts="edge", gem_fixed="",
-        el_voice="", el_model="v3"):
+        el_voice="", el_model="v3", vn_voice="", series=None):
     import wave
 
     import numpy as np
@@ -1341,6 +1648,23 @@ def dub(segs, video, workdir, voice, bg_volume, max_speed, ai_cfg=None, tts="edg
     tdir.mkdir(exist_ok=True)
     idx = [i for i, s in enumerate(segs) if s.get("vi", "").strip()]
     path = {i: tdir / f"{i:04}.mp3" for i in idx}
+    # sổ ghi các câu đã đọc: chạy lại sau khi lỗi thì dùng lại clip cũ, không tốn lượt / credit lần nữa
+    man_path = tdir / "manifest.json"
+    try:
+        manifest = json.loads(man_path.read_text(encoding="utf-8"))
+    except Exception:
+        manifest = {}
+
+    def sig(i):
+        return f"{tts}|{segs[i]['vi'].strip()}|{list(segs[i].get('voice') or [])}|{list(segs[i].get('vkey') or [])}"
+
+    def save_manifest():
+        manifest["_edge_only"] = [list(k) for k in edge_only]
+        man_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+
+    for i, v in (manifest.get("_short") or {}).items():  # câu đã rút gọn ở lần chạy trước -> dùng đúng câu đó
+        if int(i) < len(segs) and segs[int(i)].get("vi", "").strip() == v.get("from"):
+            segs[int(i)]["vi"] = v["to"]
     if not multi:
         for s in segs:
             s["voice"] = (voice, 0, 0)
@@ -1352,6 +1676,25 @@ def dub(segs, video, workdir, voice, bg_volume, max_speed, ai_cfg=None, tts="edg
             gem = {"models": list(GEMINI_TTS_MODELS), "calls": 0, "key": kc["key"]}
         else:
             log("Giọng Gemini cần API key Gemini (cài trong mục AI) -> dùng giọng Edge")
+
+    vn = None
+    if tts == "vieneu":
+        if VIENEU_PY.is_file():
+            vn = {"map": {}, "main": vn_voice if any(vn_voice in v for v in VIENEU_VOICES.values()) else ""}
+        else:
+            log("Chưa cài VieNeu-TTS (thiếu thư mục .vieneu-venv) -> dùng giọng Edge")
+
+    def series_voice(i, engine, taken):
+        """Giọng nhân vật này đã dùng ở tập trước (hồ sơ phim), nếu chưa bị nhân vật khác trong tập này dùng."""
+        name = segs[i].get("wname")
+        v = ((series or {}).get("voices", {}).get(name) or {}).get(engine) if name else None
+        return v if v and v not in taken else None
+
+    def vn_item(i):
+        key = who(i)
+        if key not in vn["map"]:  # mỗi nhân vật một giọng riêng, hợp giới tính và tuổi (hoặc giọng của tập trước)
+            vn["map"][key] = series_voice(i, "vieneu", vn["map"].values()) or vieneu_pick(key, list(vn["map"].values()))
+        return (segs[i]["vi"].strip(), path[i], vn["map"][key])
 
     el = None
     if tts == "eleven":
@@ -1370,7 +1713,8 @@ def dub(segs, video, workdir, voice, bg_volume, max_speed, ai_cfg=None, tts="edg
     def el_item(i):
         key = who(i)
         if key not in el["map"]:  # mỗi nhân vật một giọng riêng trong thư viện ElevenLabs của tài khoản
-            vid = eleven_tts.pick_voice(el["voices"], key[0], key[1], set(el["map"].values()))
+            vid = series_voice(i, "eleven", el["map"].values()) \
+                or eleven_tts.pick_voice(el["voices"], key[0], key[1], set(el["map"].values()))
             el["map"][key] = vid or el.get("main") or (el["voices"][0]["id"] if el["voices"] else "")
         return (segs[i]["vi"].strip(), path[i], el["map"][key])
 
@@ -1381,13 +1725,15 @@ def dub(segs, video, workdir, voice, bg_volume, max_speed, ai_cfg=None, tts="edg
         if (g, age, k) not in gem_voice:  # mỗi nhân vật một giọng riêng, không trùng nhân vật khác
             names = GEMINI_VOICES.get((g, age)) or GEMINI_VOICES[(g, "adult")]
             free = [n for n in names if n not in gem_voice.values()]
-            gem_voice[(g, age, k)] = free[0] if free else names[k % len(names)]
+            gem_voice[(g, age, k)] = series_voice(i, "gemini", gem_voice.values()) \
+                or (free[0] if free else names[k % len(names)])
         pace = _syllables(segs[i]["vi"]) / slot(i)  # âm tiết/giây cần đọc để kịp chỗ trống
         fast = "speaking very fast" if pace > 4.0 else "speaking quickly" if pace > 2.8 else ""
         style = ", ".join(x for x in (GEMINI_AGE_STYLE.get(age), segs[i].get("emo"), fast) if x)
         return (segs[i]["vi"].strip(), path[i], gem_voice[(g, age, k)], style)
 
-    edge_only = set()  # nhân vật mà Gemini không đọc hết được -> cả video dùng Edge, không trộn 2 giọng
+    # nhân vật mà Gemini / ElevenLabs không đọc hết được -> cả video dùng Edge, không trộn 2 giọng
+    edge_only = {tuple(k) for k in manifest.get("_edge_only") or []}
 
     def who(i):
         return segs[i].get("vkey") or ("male", "adult", 0)
@@ -1395,14 +1741,27 @@ def dub(segs, video, workdir, voice, bg_volume, max_speed, ai_cfg=None, tts="edg
     def synth(ids):
         """Tạo giọng cho các câu ids: Gemini (nếu chọn), nhưng mỗi nhân vật chỉ MỘT bộ đọc: Gemini thiếu dù một câu
         thì mọi câu của nhân vật đó đọc lại bằng Edge. Trả về danh sách câu vừa được tạo."""
+        asked, reuse = list(ids), []
+        for i in asked:
+            m = manifest.get(str(i))
+            if m and m.get("sig") == sig(i) and (tdir / m["file"]).is_file():
+                path[i] = tdir / m["file"]
+                reuse.append(i)
+        if reuse:
+            log(f"Dùng lại {len(reuse)} câu đã đọc ở lần chạy trước")
+        ids = [i for i in asked if i not in reuse]
         rest = list(ids)
-        if gem or el:
+        if gem or el or vn:
             want = [i for i in ids if who(i) not in edge_only]
             got = set()
             if want and gem and gem["models"]:
                 for i in want:
                     path[i] = tdir / f"{i:04}.wav"
                 got = gemini_tts_all([gem_item(i) for i in want], gem["key"], gem)
+            elif want and vn:
+                for i in want:
+                    path[i] = tdir / f"{i:04}.vn.wav"
+                got = vieneu_speak_all([vn_item(i) for i in want])
             elif want and el and not el.get("dead"):
                 for i in want:
                     path[i] = tdir / f"{i:04}.el.mp3"
@@ -1412,7 +1771,7 @@ def dub(segs, video, workdir, voice, bg_volume, max_speed, ai_cfg=None, tts="edg
             lost = {who(i) for n, i in enumerate(want) if n not in got}
             if lost:
                 edge_only.update(lost)
-                log(f"{'Gemini' if gem else 'ElevenLabs'} không đọc hết được lời của {len(lost)} nhân vật -> nhân vật "
+                log(f"{'Gemini' if gem else 'VieNeu' if vn else 'ElevenLabs'} không đọc hết được lời của {len(lost)} nhân vật -> nhân vật "
                     "đó dùng giọng Edge cho cả video (không trộn 2 giọng)")
             rest = [i for i in idx if who(i) in edge_only
                     and (i in ids or path[i].suffix == ".wav" or path[i].name.endswith(".el.mp3"))]
@@ -1420,7 +1779,11 @@ def dub(segs, video, workdir, voice, bg_volume, max_speed, ai_cfg=None, tts="edg
                 path[i] = tdir / f"{i:04}.mp3"
         if rest:
             tts_all([(segs[i]["vi"].strip(), path[i], segs[i]["voice"]) for i in rest], MALE)
-        return sorted(set(ids) | set(rest))
+        for i in set(ids) | set(rest):
+            if path[i].is_file():
+                manifest[str(i)] = {"sig": sig(i), "file": path[i].name}
+        save_manifest()
+        return sorted(set(asked) | set(rest))
 
     def slot(i):  # thời gian có thể đọc: tới lúc câu sau bắt đầu
         nxt = segs[i + 1]["start"] if i + 1 < len(segs) else total
@@ -1431,27 +1794,52 @@ def dub(segs, video, workdir, voice, bg_volume, max_speed, ai_cfg=None, tts="edg
         main = max(set(keys), key=keys.count)
         gem_voice[main] = gem_fixed
         log(f"Giọng Gemini đã chọn: {gem_fixed}" + (" (cho nhân vật nói nhiều nhất)" if len(set(keys)) > 1 else ""))
-    def shorten(ids):
-        new = ai_shorten([(segs[i]["zh"], segs[i]["vi"], max(3, int(slot(i) * VI_SYLLABLES_PER_SEC))) for i in ids], ai_cfg)
+    def shorten(ids, rate=VI_SYLLABLES_PER_SEC * 1.15):
+        new = ai_shorten([(segs[i]["zh"], segs[i]["vi"], max(3, int(slot(i) * rate))) for i in ids], ai_cfg)
+        book = manifest.setdefault("_short", {})
         for i, v in zip(ids, new):
-            segs[i]["vi"] = v
+            if v != segs[i]["vi"]:
+                book[str(i)] = {"from": (book.get(str(i)) or {}).get("from", segs[i]["vi"].strip()), "to": v}
+                segs[i]["vi"] = v
+        save_manifest()
 
+    if vn and idx:
+        keys = [who(i) for i in idx]
+        main = max(set(keys), key=keys.count)
+        if vn["main"]:  # giọng người dùng chọn -> dành cho người nói nhiều nhất (người dẫn / vai chính)
+            vn["map"][main] = vn["main"]
+        for k in sorted(set(keys), key=lambda k: -keys.count(k)):  # gán theo thứ tự nói nhiều -> ít, rồi ghi rõ
+            i0 = next(i for i in idx if who(i) == k)
+            label = segs[i0].get("wname") or f"{'nam' if k[0] == 'male' else 'nữ'}, {k[1]} (chưa rõ tên)"
+            log(f"  Giọng VieNeu cho {label}: {vn_item(i0)[2]} ({keys.count(k)} câu)")
+        # VieNeu đọc chậm hơn Edge và đọc lại thì tốn thời gian máy -> rút gọn câu quá dài trước khi đọc
+        # (đọc lại không tốn tiền nên chỉ rút gọn câu dài hẳn; câu hơi dài thì đọc nhanh lên để giữ con số, tên riêng)
+        pre = [i for i in idx if _syllables(segs[i]["vi"]) / EL_SYLLABLES_PER_SEC / slot(i) > 1.5]
+        if pre and ai_cfg and not manifest.get("_pre_done"):
+            log(f"Rút gọn trước {len(pre)} câu dài...")
+            try:
+                shorten(pre, EL_SYLLABLES_PER_SEC * 1.3)
+            except Exception as e:
+                log(f"Không rút gọn trước được ({str(e)[:120]})")
+        manifest["_pre_done"] = True
     if el and idx:
         keys = [who(i) for i in idx]
         main = max(set(keys), key=keys.count)
-        ids = {v["id"]: v["name"] for v in el["voices"]}
+        names_el = {v["id"]: v["name"] for v in el["voices"]}
         if el_voice:  # giọng người dùng chọn -> dành cho người nói nhiều nhất (người dẫn / vai chính)
             el["map"][main] = el["main"] = el_voice
-            log(f"Giọng ElevenLabs đã chọn: {ids.get(el_voice, el_voice)}"
+            log(f"Giọng ElevenLabs đã chọn: {names_el.get(el_voice, el_voice)}"
                 + (" (cho nhân vật nói nhiều nhất)" if len(set(keys)) > 1 else ""))
-        # ElevenLabs tính tiền theo ký tự: rút gọn câu quá dài TRƯỚC khi đọc, khỏi phải trả tiền đọc hai lần
-        pre = [i for i in idx if _syllables(segs[i]["vi"]) / VI_SYLLABLES_PER_SEC / slot(i) > 1.2]
-        if pre and ai_cfg:
+        # ElevenLabs tính tiền theo ký tự và đọc chậm hơn Edge: rút gọn câu quá dài TRƯỚC khi đọc (ước lượng theo
+        # tốc độ đọc của ElevenLabs), để gần như không phải trả tiền đọc lại lần hai
+        pre = [i for i in idx if _syllables(segs[i]["vi"]) / EL_SYLLABLES_PER_SEC / slot(i) > 1.3]
+        if pre and ai_cfg and not manifest.get("_pre_done"):
             log(f"Rút gọn trước {len(pre)} câu dài (đỡ tốn credit đọc lại)...")
             try:
-                shorten(pre)
+                shorten(pre, EL_SYLLABLES_PER_SEC * 1.2)
             except Exception as e:
                 log(f"Không rút gọn trước được ({str(e)[:120]})")
+        manifest["_pre_done"] = True
     synth(idx)
     if gem:
         log(f"Giọng Gemini: {gem['calls']} lượt gọi")
@@ -1459,17 +1847,28 @@ def dub(segs, video, workdir, voice, bg_volume, max_speed, ai_cfg=None, tts="edg
         log(el["note"])
     clips = {i: decode_pcm(path[i]) for i in idx}
 
-    # câu tiếng Việt dài hơn nhiều so với thời gian nói -> nhờ AI rút gọn rồi đọc lại
-    long = [i for i in idx if len(clips[i]) / SR / slot(i) > 1.2]
-    if long and ai_cfg:
+    # câu tiếng Việt dài hơn nhiều so với thời gian nói -> nhờ AI rút gọn rồi đọc lại. Dài hơn chút ít thì chỉ đọc
+    # nhanh lên (giữ được ý). Với ElevenLabs chỉ đọc lại khi tăng tốc cũng không kịp, vì mỗi lần đọc lại là tốn credit.
+    limit = max_speed if el else 1.3
+    long = [i for i in idx if len(clips[i]) / SR / slot(i) > limit]
+    if long and ai_cfg and not manifest.get("_post_done"):
         log(f"Rút gọn {len(long)} câu quá dài để đọc kịp...")
         try:
-            shorten(long)
+            shorten(long, (EL_SYLLABLES_PER_SEC if el else VI_SYLLABLES_PER_SEC) * 1.15)
             for i in synth(long):
                 clips[i] = decode_pcm(path[i])
         except Exception as e:
             log(f"Không rút gọn được ({str(e)[:120]}), sẽ đọc nhanh hơn")
+    manifest["_post_done"] = True
+    save_manifest()
 
+    if series is not None:  # ghi lại giọng từng nhân vật đã dùng -> tập sau dùng đúng giọng đó
+        engine_map = {"vieneu": (vn or {}).get("map"), "eleven": (el or {}).get("map"), "gemini": gem_voice if gem else None}
+        for engine, m in engine_map.items():
+            for i in idx:
+                name, key = segs[i].get("wname"), who(i)
+                if m and name and key in m and m[key]:
+                    series.setdefault("voices", {}).setdefault(name, {})[engine] = m[key]
     if el:
         cost = el["chars"] * (0.5 if el["model"] == "flash" else 1)
         log(f"Giọng ElevenLabs ({eleven_tts.MODELS[el['model']]}): đọc {el['chars']} ký tự, khoảng {cost:.0f} credit")
@@ -1617,34 +2016,104 @@ def speech_intervals(segs, before=0.3, after=0.8, join=1.2):
     return out
 
 
-def render(video, srt_name, audio, out_path, workdir, font_size, burn, band=None, speech=None):
+def srt_to_ass(srt_path, ass_path, top, size=64):
+    """Đổi phụ đề .srt sang .ass cho khung dọc 1080x1920: chữ to, canh giữa, mép trên của chữ nằm ở toạ độ y = top."""
+    def ts(t):  # 00:01:02,345 -> 0:01:02.34
+        h, m, rest = t.strip().split(":")
+        sec, ms = rest.split(",")
+        return f"{int(h)}:{m}:{sec}.{ms[:2]}"
+
+    head = ("[Script Info]\nScriptType: v4.00+\nPlayResX: 1080\nPlayResY: 1920\nWrapStyle: 0\n"
+            "ScaledBorderAndShadow: yes\n\n[V4+ Styles]\n"
+            "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, "
+            "Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, "
+            "MarginR, MarginV, Encoding\n"
+            f"Style: Default,Arial,{size},&H00FFFFFF,&H000000FF,&H00000000,&H96000000,-1,0,0,0,100,100,0,0,1,5,2,8,"
+            f"60,60,{int(top)},1\n\n[Events]\n"
+            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n")
+    out = []
+    for block in re.split(r"\r?\n\r?\n", Path(srt_path).read_text(encoding="utf-8").strip()):
+        lines = block.splitlines()
+        if len(lines) >= 3 and "-->" in lines[1]:
+            a, b = lines[1].split("-->")
+            text = " ".join(x.strip() for x in lines[2:]).replace("{", "(").replace("}", ")")
+            out.append(f"Dialogue: 0,{ts(a)},{ts(b)},Default,,0,0,0,,{text}")
+    Path(ass_path).write_text(head + "\n".join(out) + "\n", encoding="utf-8")
+
+
+def vertical_box(w, h):
+    """Vị trí (y, cao) của video ngang khi đặt vào khung dọc 1080x1920 (hơi lệch lên trên, chừa chỗ cho phụ đề)."""
+    vh = int(1080 * h / w / 2) * 2
+    vy = max(420, (1920 - vh) // 2 - 96) // 2 * 2
+    return vy, vh
+
+
+def render(video, srt_name, audio, out_path, workdir, font_size, burn, band=None, speech=None, vertical=None, logo=None):
+    """Xuất video. Không có gì chạm vào hình thì sao chép luồng hình (nhanh, giữ nguyên chất lượng).
+    vertical: None hoặc {"title_png": file | None} -> khung dọc 1080x1920: nền mờ, video ở giữa, tiêu đề phía trên,
+              phụ đề Việt chữ to phía dưới (không đè lên hình gốc).
+    logo:     None hoặc {"path", "pos": "tl|tr|bl|br", "size": % bề ngang video} -> chèn logo kênh vào góc video."""
     cmd = ["ffmpeg", "-y", "-i", str(video)]
+    n_in = 1
     if audio:
         cmd += ["-i", str(audio)]
-    if burn:
-        margin_v = 40
-        chain = "[0:v]"
-        if band:
-            w, h = video_size(video)
-            y = int(h * band[0]) // 2 * 2
-            bh = max(2, (int(h * band[1]) - y) // 2 * 2)
-            # chỉ che khi đang có thoại -> cảnh không thoại không bị vệt tối vắt ngang
-            # (quá nhiều đoạn thì biểu thức quá dài -> che suốt video)
-            enable = ""
-            if speech and len(speech) <= 400:
-                enable = ":enable='" + "+".join(f"between(t,{a:.2f},{b:.2f})" for a, b in speech) + "'"
-            # làm mờ mạnh + phủ tối dải chữ Trung in cứng (không còn bóng chữ), rồi đặt phụ đề Việt đè lên
-            chain = (f"[0:v]split[base][cut];[cut]crop=iw:{bh}:0:{y},gblur=sigma=30:steps=3,"
+        n_in += 1
+    w, h = video_size(video)
+    graph, cur = [], "[0:v]"
+    margin_v = 40
+    if burn and band:
+        y = int(h * band[0]) // 2 * 2
+        bh = max(2, (int(h * band[1]) - y) // 2 * 2)
+        # chỉ che khi đang có thoại -> cảnh không thoại không bị vệt tối vắt ngang
+        # (quá nhiều đoạn thì biểu thức quá dài -> che suốt video)
+        enable = ""
+        if speech and len(speech) <= 400:
+            enable = ":enable='" + "+".join(f"between(t,{a:.2f},{b:.2f})" for a, b in speech) + "'"
+        # làm mờ mạnh + phủ tối dải chữ Trung in cứng (không còn bóng chữ), rồi đặt phụ đề Việt đè lên
+        graph.append(f"{cur}split[base][cut];[cut]crop=iw:{bh}:0:{y},gblur=sigma=30:steps=3,"
                      f"drawbox=x=0:y=0:w=iw:h=ih:color=black@0.72:t=fill[blur];"
-                     f"[base][blur]overlay=0:{y}{enable}[cov];[cov]")
-            margin_v = max(4, int((h - y - bh) / h * 288) + 2)
+                     f"[base][blur]overlay=0:{y}{enable}[cov]")
+        cur = "[cov]"
+        margin_v = max(4, int((h - y - bh) / h * 288) + 2)
+    box = (0, 0, w, h)  # vùng hình gốc trong khung xuất (x, y, rộng, cao)
+    if vertical:
+        vy, vh = vertical_box(w, h)
+        graph.append(f"{cur}split=2[vb][vf];"
+                     f"[vb]scale=270:480:force_original_aspect_ratio=increase,crop=270:480,gblur=sigma=8,"
+                     f"scale=1080:1920,eq=brightness=-0.2:saturation=0.9,"
+                     f"drawbox=x=0:y={vy - 8}:w=1080:h={vh + 16}:color=0xFFD60A:t=fill[bg];"
+                     f"[vf]scale=1080:{vh}[fg];[bg][fg]overlay=0:{vy}[vv]")
+        cur, box = "[vv]", (0, vy, 1080, vh)
+        if vertical.get("title_png"):
+            cmd += ["-i", str(vertical["title_png"])]
+            graph.append(f"{cur}[{n_in}:v]overlay=0:0[vt]")
+            cur, n_in = "[vt]", n_in + 1
+    if logo:
+        cmd += ["-i", str(logo["path"])]
+        lw = max(40, int(box[2] * float(logo.get("size", 12)) / 100) // 2 * 2)
+        pad = int(box[2] * 0.02)
+        pos = logo.get("pos", "tr")
+        x = str(box[0] + pad) if pos[1] == "l" else f"{box[0] + box[2] - pad}-w"
+        yy = str(box[1] + pad) if pos[0] == "t" else f"{box[1] + box[3] - pad}-h"
+        graph.append(f"[{n_in}:v]scale={lw}:-1[lg];{cur}[lg]overlay={x}:{yy}[vl]")
+        cur, n_in = "[vl]", n_in + 1
+    if vertical:
+        # phụ đề nằm DƯỚI khung hình (không đè lên hình gốc): file .ass riêng, toạ độ tính theo điểm ảnh
+        ass = Path(srt_name).with_suffix(".ass").name
+        srt_to_ass(Path(workdir) / srt_name, Path(workdir) / ass, box[1] + box[3] + 44)
+        graph.append(f"{cur}subtitles={ass}[v]")
+        cur = "[v]"
+    elif burn:
         style = (
             f"FontName=Arial,FontSize={font_size},PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
             f"BackColour=&H99000000,BorderStyle=3,Outline=2,Shadow=0,Alignment=2,MarginV={margin_v},Bold=1"
         )
         # chạy trong workdir để tránh lỗi đường dẫn Windows trong filter subtitles
-        cmd += ["-filter_complex", f"{chain}subtitles={srt_name}:force_style='{style}'[v]", "-map", "[v]",
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "21"]
+        graph.append(f"{cur}subtitles={srt_name}:force_style='{style}'[v]")
+        cur = "[v]"
+    if graph:
+        cmd += ["-filter_complex", ";".join(graph), "-map", cur,
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p"]
     else:
         cmd += ["-map", "0:v:0", "-c:v", "copy"]
     cmd += ["-map", "1:a:0" if audio else "0:a:0?"]
@@ -1652,6 +2121,93 @@ def render(video, srt_name, audio, out_path, workdir, font_size, burn, band=None
         cmd += ["-c:a", "copy"]
     cmd += ["-movflags", "+faststart", str(out_path)]
     run(cmd, cwd=workdir)
+
+
+def load_profile():
+    """Hồ sơ kênh lưu trong config.json: tên kênh, hashtag mặc định, logo (profile/logo.png) và vị trí đặt."""
+    try:
+        pr = json.loads(CONFIG_PATH.read_text(encoding="utf-8")).get("profile") or {}
+    except Exception:
+        pr = {}
+    out = {"channel": str(pr.get("channel") or "").strip(),
+           "hashtags": [t for t in re.split(r"[\s,#]+", str(pr.get("hashtags") or "")) if t], "logo": None}
+    logo = CONFIG_PATH.parent / "profile" / "logo.png"
+    if pr.get("logo_on") and logo.is_file():
+        pos = pr.get("logo_pos") if pr.get("logo_pos") in ("tl", "tr", "bl", "br") else "tr"
+        try:
+            size = min(30.0, max(5.0, float(pr.get("logo_size", 12))))
+        except (TypeError, ValueError):
+            size = 12.0
+        out["logo"] = {"path": logo, "pos": pos, "size": size}
+    return out
+
+
+CACHE_DIR = Path(__file__).resolve().parent / "output" / "_cache"
+LAST_TRANSLATOR = ""  # ai đã dịch lần gần nhất: "gemini/model..." hoặc "google"
+
+
+def video_key(path):
+    """Mã nhận diện video theo nội dung (kích thước + 4 MB đầu + 4 MB cuối): cùng file thì cùng mã, dù đổi tên."""
+    import hashlib
+
+    p = Path(path)
+    size = p.stat().st_size
+    h = hashlib.sha1(str(size).encode())
+    with open(p, "rb") as f:
+        h.update(f.read(4 << 20))
+        if size > (8 << 20):
+            f.seek(size - (4 << 20))
+            h.update(f.read(4 << 20))
+    return h.hexdigest()[:20]
+
+
+def _jload(path):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _jdump(path, obj):
+    def enc(o):  # số numpy, Path, tuple lạ...
+        try:
+            return float(o)
+        except (TypeError, ValueError):
+            return str(o)
+
+    Path(path).write_text(json.dumps(obj, ensure_ascii=False, default=enc), encoding="utf-8")
+
+
+def rename_outputs(outdir, base, vi_base, out_path, video):
+    """Đổi tên các file kết quả "<base>.*" thành "<vi_base>.*" (ghi đè bản cũ cùng tên khi xuất lại)."""
+    if not vi_base or vi_base == base:
+        return out_path, video
+    video = Path(video)
+    for p in list(Path(outdir).glob("*")):
+        if p.is_file() and p.name.startswith(base + "."):
+            new = p.with_name(vi_base + p.name[len(base):])
+            try:
+                os.replace(p, new)
+            except OSError:
+                continue
+            if p == Path(out_path):
+                out_path = new
+            if p == video:
+                video = new
+    return out_path, video
+
+
+def vi_file_name(title, fallback, part=""):
+    """Tên file từ tiêu đề Việt: bỏ ký tự Windows cấm, cắt ở ranh giới từ (<= 80 ký tự), giữ số phần."""
+    s = re.sub(r"[#@].*", "", title or "")
+    s = re.sub(r'[\\/:*?"<>|\r\n\t]+', " ", s)
+    s = re.sub(r"\s+", " ", s).strip(" .")
+    n = (part or "").split("/")[0].strip()
+    tail = f" - Phần {n}" if n and not re.search(rf"Phần\s*{re.escape(n)}", s) else ""
+    limit = 80 - len(tail)
+    if len(s) > limit:
+        s = s[:limit].rsplit(" ", 1)[0].rstrip(" ,.;-–—")
+    return (s + tail).strip() or fallback
 
 
 def safe_name(s, fallback):
@@ -1671,7 +2227,8 @@ def main():
     ap.add_argument("--eleven-voice", default="", help="ID giọng ElevenLabs cho người nói nhiều nhất (trống = tự chọn)")
     ap.add_argument("--eleven-model", choices=["v3", "flash"], default="v3",
                     help="Model ElevenLabs: v3 (hay nhất, 1 credit/ký tự) / flash (0,5 credit/ký tự)")
-    ap.add_argument("--tts", choices=["edge", "gemini", "eleven"], default="edge",
+    ap.add_argument("--vieneu-voice", default="", help="Tên giọng VieNeu cho người nói nhiều nhất (trống = tự chọn)")
+    ap.add_argument("--tts", choices=["edge", "gemini", "eleven", "vieneu"], default="edge",
                     help="Bộ đọc: edge (miễn phí, 2 giọng) / gemini (giọng AI nhiều giọng, có cảm xúc; dùng key Gemini)")
     ap.add_argument("--gemini-voice", default="", choices=[""] + GEMINI_PICK,
                     help="Giọng Gemini cố định cho người nói nhiều nhất (bỏ trống = tự chọn theo nhân vật)")
@@ -1685,8 +2242,24 @@ def main():
     ap.add_argument("--no-burn", action="store_true", help=argparse.SUPPRESS)  # giữ cho lệnh cũ, nay là mặc định
     ap.add_argument("--cover-subs", choices=["auto", "off"], default="auto",
                     help="Khi dùng --subs: tự dò và làm mờ phụ đề Trung in cứng (mặc định auto)")
+    ap.add_argument("--no-cover", action="store_true", help="Không tạo ảnh bìa + tiêu đề TikTok")
+    ap.add_argument("--part", default="", help="Video là phần k/n của một video dài, ví dụ 2/7 (ghi lên ảnh bìa và tiêu đề)")
+    ap.add_argument("--title-hint", default="", help="Tiêu đề gốc của video (khi nguồn là file không có tiêu đề)")
     ap.add_argument("--no-ai", action="store_true", help="Không dịch bằng AI, dùng Google Dịch")
     ap.add_argument("--cookies-from-browser", help="Dùng cookie trình duyệt cho yt-dlp nếu cần (chrome/edge/firefox)")
+    ap.add_argument("--vertical", action="store_true",
+                    help="Video ngang -> xuất khung dọc 9:16 cho TikTok (nền mờ, tiêu đề trên, phụ đề Việt dưới)")
+    ap.add_argument("--confirm-dub", action="store_true",
+                    help="Dừng sau bước dịch để duyệt bản dịch + chi phí; chạy lại lệnh (không có cờ này) để lồng tiếng tiếp")
+    ap.add_argument("--no-cache", action="store_true",
+                    help="Không dùng (và không lưu) lời nghe / bản dịch đã nhớ của video này")
+    ap.add_argument("--retranslate", action="store_true", help="Vẫn dùng lại lời đã nghe nhưng dịch lại từ đầu")
+    ap.add_argument("--asr", choices=["local", "eleven"], default="local",
+                    help="Nghe tiếng Trung: local (trên máy, miễn phí) / eleven (đám mây ElevenLabs, nhanh, tốn credit)")
+    ap.add_argument("--beam", type=int, default=2, help="Độ kỹ khi nghe trên máy (1-5; nhỏ hơn = nhanh hơn)")
+    ap.add_argument("--series", default="", help="Tên bộ phim: giữ tên nhân vật, xưng hô và giọng giống nhau giữa các tập")
+    ap.add_argument("--fresh", action="store_true", help="Bỏ kết quả dở của lần chạy trước, làm lại từ đầu")
+    ap.add_argument("--no-profile", action="store_true", help="Không áp dụng hồ sơ kênh (logo, hashtag, tên kênh)")
     args = ap.parse_args()
 
     if not shutil.which("ffmpeg"):
@@ -1694,27 +2267,104 @@ def main():
 
     outdir = Path(args.outdir).resolve()
     outdir.mkdir(parents=True, exist_ok=True)
-    # thư mục làm việc nằm trong thư mục kết quả (tránh lỗi TEMP khác nhau khi chạy từ web)
-    workdir = Path(tempfile.mkdtemp(prefix="_tmp_", dir=outdir))
+    # Thư mục làm việc nằm trong thư mục kết quả và ĐƯỢC GIỮ LẠI khi lỗi / tạm dừng: lần chạy sau với cùng nguồn sẽ
+    # dùng lại video đã tải, lời đã nghe, bản dịch và các câu đã đọc -> không làm lại, không tốn credit lần nữa.
+    state = outdir / "_resume"
+    if args.fresh:
+        shutil.rmtree(state, ignore_errors=True)
+    state.mkdir(exist_ok=True)
+    workdir = state
+    profile = {"channel": "", "hashtags": [], "logo": None} if args.no_profile else load_profile()
+    series = load_series(args.series.strip()) if args.series.strip() else None
+    finished = False
     try:
-        video, title = download(args.source, workdir, args.cookies_from_browser)
-        base = safe_name(title, f"douyin_{os.getpid()}")
+        src = _jload(state / "source.json")
+        if src and src.get("source") == args.source and Path(src.get("video") or "_").is_file()                 and has_audio(src["video"]):  # bản tải lỗi trước đây (không có tiếng) thì tải lại
+            video, title, base = Path(src["video"]), src.get("title", ""), src["base"]
+            log("Chạy tiếp: dùng lại video đã tải")
+        else:
+            video, title = download(args.source, workdir, args.cookies_from_browser)
+            base = safe_name(title, f"douyin_{os.getpid()}")
+            _jdump(state / "source.json", {"source": args.source, "video": str(video), "title": title, "base": base})
         total = media_duration(video)
-        segs = transcribe(video, workdir, args.model, args.lang, title)
-        if not segs:
-            sys.exit("Không nhận dạng được lời thoại nào trong video.")
+        cdir = None
+        if not args.no_cache:
+            try:
+                cdir = CACHE_DIR / video_key(video)
+                cdir.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                cdir = None
+
+        asr = _jload(state / "segs_asr.json")
+        if asr and asr.get("key") == [args.model, args.lang] and asr.get("segs") and (state / "audio16k.wav").is_file():
+            segs = asr["segs"]
+            log(f"Chạy tiếp: dùng lại {len(segs)} câu đã nghe được")
+        else:
+            # Bộ nhớ theo nội dung video: video này từng được nghe (cùng chế độ nghe) thì khỏi nghe lại
+            cached = _jload(cdir / f"asr_{args.model}_{args.lang}.json") if cdir else None
+            if cached and cached.get("segs"):
+                segs = cached["segs"]
+                run(["ffmpeg", "-y", "-i", str(video), "-vn", "-ac", "1", "-ar", "16000", str(state / "audio16k.wav")])
+                log(f"Video này đã được nghe trước đây -> dùng lại {len(segs)} câu, bỏ qua bước nghe tiếng Trung")
+            else:
+                segs = transcribe(video, workdir, args.model, args.lang, title, engine=args.asr,
+                                  beam=max(1, min(5, args.beam)))
+                if not segs:
+                    sys.exit("Không nhận dạng được lời thoại nào trong video.")
+                if cdir:
+                    _jdump(cdir / f"asr_{args.model}_{args.lang}.json", {"segs": segs, "title": title})
+            _jdump(state / "segs_asr.json", {"key": [args.model, args.lang], "segs": segs})
+
         ai_cfg = None if args.no_ai else load_ai_config()
         if not ai_cfg and not args.no_ai:
             log("Chưa cài API key AI -> dịch bằng Google Dịch (kém tự nhiên hơn). Xem README để bật dịch AI.")
-        chars, _ = translate(segs, args.lang, title, total, ai_cfg)
+        tr = _jload(state / "segs_vi.json")
+        if tr and len(tr.get("segs") or []) == len(segs):
+            segs, chars = tr["segs"], tr.get("chars") or []
+            log(f"Chạy tiếp: dùng lại bản dịch {len(segs)} câu")
+        else:
+            vfile = cdir / f"vi_{args.model}_{args.lang}.json" if cdir else None
+            cached = _jload(vfile) if vfile and not args.retranslate else None
+            # chỉ dùng lại bản dịch do AI dịch; bản Google Dịch (dự phòng khi AI lỗi) thì dịch lại nếu giờ đã có AI
+            if cached and len(cached.get("segs") or []) == len(segs) and (cached.get("by") != "google" or not ai_cfg):
+                segs, chars = cached["segs"], cached.get("chars") or []
+                log(f"Video này đã được dịch trước đây ({cached.get('by') or '?'}) -> dùng lại bản dịch {len(segs)} câu. "
+                    "Muốn dịch lại thì bật \"Dịch lại từ đầu\"")
+            else:
+                chars, _ = translate(segs, args.lang, title, total, ai_cfg, series=series)
+                save_series(series)
+                old = _jload(vfile) if vfile else None
+                # không để bản Google Dịch ghi đè một bản AI đã lưu
+                if vfile and not (LAST_TRANSLATOR == "google" and old and old.get("by") != "google"):
+                    _jdump(vfile, {"segs": segs, "chars": chars, "by": LAST_TRANSLATOR})
+            _jdump(state / "segs_vi.json", {"segs": segs, "chars": chars})
 
         audio = None
-        if not args.no_dub and args.voice == "auto":
-            assign_voices(segs, chars, workdir / "audio16k.wav")
         if not args.no_dub:
-            audio = dub(segs, video, workdir, VOICES.get(args.voice, args.voice), args.bg_volume, args.max_speed, ai_cfg,
-                        tts=args.tts, gem_fixed=args.gemini_voice,
-                        el_voice=args.eleven_voice, el_model=args.eleven_model)
+            est = dub_estimate(segs, args.tts, args.eleven_model)
+            log("Ước tính lồng tiếng: " + estimate_text(est))
+            if args.confirm_dub:
+                write_srt(segs, outdir / f"{base}.vi.srt", "vi")
+                write_srt(segs, outdir / f"{base}.zh.srt", "zh")
+                print("ESTIMATE_JSON: " + json.dumps(est, ensure_ascii=False), flush=True)
+                log("Tạm dừng: chờ bạn duyệt bản dịch và chi phí rồi bấm lồng tiếng")
+                return
+            dkey = [args.tts, args.voice, args.gemini_voice, args.eleven_voice, args.eleven_model, args.bg_volume,
+                    args.vieneu_voice, args.series]
+            dubbed = _jload(state / "segs_dub.json")
+            if dubbed and dubbed.get("key") == dkey and len(dubbed.get("segs") or []) == len(segs) \
+                    and Path(dubbed.get("audio") or "_").is_file():
+                segs, audio = dubbed["segs"], Path(dubbed["audio"])
+                log("Chạy tiếp: dùng lại phần tiếng đã lồng")
+            else:
+                if args.voice == "auto":
+                    assign_voices(segs, chars, workdir / "audio16k.wav")
+                audio = dub(segs, video, workdir, VOICES.get(args.voice, args.voice), args.bg_volume, args.max_speed,
+                            ai_cfg, tts=args.tts, gem_fixed=args.gemini_voice,
+                            el_voice=args.eleven_voice, el_model=args.eleven_model, vn_voice=args.vieneu_voice,
+                            series=series)
+                save_series(series)
+                _jdump(state / "segs_dub.json", {"key": dkey, "segs": segs, "audio": str(audio)})
         fit_subtitle_times(segs, total)
 
         write_srt(segs, workdir / "sub.srt", "vi")
@@ -1728,13 +2378,72 @@ def main():
             log(f"Phát hiện phụ đề in cứng ở {band[0]:.0%}-{band[1]:.0%} chiều cao -> làm mờ" if band
                 else "Không thấy phụ đề in cứng trong video gốc")
 
+        # tiêu đề + chữ ảnh bìa: cần trước khi xuất vì khung dọc ghi tiêu đề lên video
+        meta = None
+        if True:  # luôn cần: tiêu đề Việt dùng làm tên video / tên file
+            try:
+                import cover
+
+                meta = _jload(state / "meta.json")
+                if not meta:
+                    log("Viết tiêu đề và hashtag TikTok...")
+                    meta = cover.write_meta(segs, args.title_hint or title, ai_cfg, args.part, profile["hashtags"])
+                    _jdump(state / "meta.json", meta)
+            except Exception as e:
+                log(f"Không viết được tiêu đề ({str(e)[:150]})")
+
+        vertical = None
+        if args.vertical:
+            w, h = video_size(video)
+            if w > h * 1.15:
+                vertical = {"title_png": None}
+                try:
+                    if meta:
+                        cover.title_overlay(workdir / "title.png", meta["cover"], vertical_box(w, h)[0], args.part)
+                        vertical["title_png"] = workdir / "title.png"
+                except Exception as e:
+                    log(f"Không vẽ được tiêu đề lên khung dọc ({str(e)[:120]})")
+            else:
+                log("Video gốc đã là khung dọc -> giữ nguyên khung hình")
+
         out_path = outdir / f"{base}.vi.mp4"
-        log("Đang xuất video..." if burn else "Đang xuất video (giữ nguyên hình gốc, chỉ thay tiếng)...")
-        render(video, "sub.srt", audio, out_path, workdir, args.font_size, burn, band, speech_intervals(segs))
-        shutil.copy(video, outdir / f"{base}.goc.mp4") if Path(video).parent == workdir else None
+        log("Đang xuất video (khung dọc 9:16 cho TikTok)..." if vertical
+            else "Đang xuất video..." if (burn or profile["logo"])
+            else "Đang xuất video (giữ nguyên hình gốc, chỉ thay tiếng)...")
+        render(video, "sub.srt", audio, out_path, workdir, args.font_size, burn, band, speech_intervals(segs),
+               vertical=vertical, logo=profile["logo"])
+        if not args.no_cover and meta:
+            log("Tạo ảnh bìa TikTok...")
+            try:
+                try:
+                    cband = band or detect_hardsub_band(video, segs)
+                except Exception:
+                    cband = None
+                cover.build(video, segs, args.title_hint or title, ai_cfg, outdir, base, total, band=cband,
+                            part=args.part, meta=meta, channel=profile["channel"])
+            except Exception as e:
+                log(f"Không tạo được ảnh bìa ({str(e)[:150]})")
+        if Path(video).parent == workdir:
+            shutil.move(str(video), str(outdir / f"{base}.goc.mp4"))
+            video = outdir / f"{base}.goc.mp4"
+        # đặt tên file theo tiêu đề tiếng Việt (tên gốc tiếng Trung khó đọc khi lưu / tìm lại)
+        vi_title = re.sub(r"\s+", " ", (meta or {}).get("title") or "").strip()
+        if vi_title:
+            log(f"Tiêu đề Việt: {vi_title}")
+            vi_base = vi_file_name(vi_title, base, args.part)
+            out_path, video = rename_outputs(outdir, base, vi_base, out_path, video)
+        _jdump(state / "source.json", {"source": args.source, "video": str(video), "title": title, "base": base})
         log(f"XONG! -> {out_path}")
+        finished = True
     finally:
-        shutil.rmtree(workdir, ignore_errors=True)
+        if finished:
+            # Giữ lại phần nhỏ (lời nghe, bản dịch, các câu đã đọc) để SỬA TỪNG CÂU sau này: chỉ đọc lại câu bị sửa.
+            # Bỏ các file tiếng lớn, lần sau tạo lại từ các câu đã đọc trong vài giây.
+            # giữ mixed.m4a (tiếng đã lồng, vài MB): đổi khung ngang/dọc sau này chỉ cần xuất lại, không lồng tiếng lại
+            for name in ("audio16k_pad.wav", "voice_vi.wav", "mix.wav", "sub.ass"):
+                (state / name).unlink(missing_ok=True)
+            for f in (state / "tts").glob("vieneu_jobs.json"):
+                f.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

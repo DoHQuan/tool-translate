@@ -91,3 +91,26 @@ Cũng dùng được với file video có sẵn: `python douyin_dub.py video.mp4
 - Tiếng Việt của Microsoft chỉ có 2 giọng (1 nam, 1 nữ): giọng trẻ con và nhiều nhân vật cùng giới được tạo bằng cách chỉnh cao độ.
 - AI đoán người nói theo nội dung lời thoại nên đôi khi nhầm (câu của nhân vật này lồng giọng nhân vật khác).
 - Video chỉ có nhạc, không có lời thoại thì không có gì để dịch.
+# Dịch qua chat2api
+
+## Tìm video theo chủ đề
+
+Ở đầu giao diện, nhập chủ đề, chọn Douyin hoặc Bilibili và bấm **Tìm video**. Tùy chọn dịch từ khóa dùng Google Translate để đổi chủ đề tiếng Việt sang tiếng Trung; bỏ chọn nếu bạn nhập từ khóa Trung trực tiếp. Kết quả có ảnh (nếu nguồn cung cấp), tiêu đề, nút **Xem gốc** và **Chọn để dịch**. Chọn video đưa link vào biểu mẫu hiện có; chỉnh tùy chọn rồi bấm Bắt đầu dịch.
+
+Mỗi lần hiển thị tối đa 12 video. Tìm kiếm dùng Chromium của tool, không yêu cầu API key riêng. Nguồn có thể yêu cầu đăng nhập/xác minh hoặc chặn truy cập: khi đó tool hiển thị thông báo và nút mở trang tìm kiếm nguồn để bạn tìm rồi dán link thủ công.
+
+Khi đã chọn chat2api cục bộ ở cổng 5005, mở tool bằng biểu tượng ứng dụng hoặc `chay-server.bat` sẽ tự bật chat2api chạy nền. Server đang chạy sẽ được dùng lại. Đóng cửa sổ giao diện vẫn giữ các server nền như trước; không cần mở riêng `chay-chat2api.bat`. Server ở địa chỉ tùy chỉnh vẫn do người dùng tự chạy.
+
+Tool hỗ trợ server [chat2api](https://github.com/lanqian528/chat2api) trong phần **Dịch bằng AI**.
+
+1. Chạy server chat2api riêng theo README của repo đó; mặc định server nghe cổng `5005`.
+2. Trong tool, chọn nhà cung cấp **chat2api (server ChatGPT web)**.
+3. Nhập địa chỉ `http://127.0.0.1:5005/v1`. Nếu server dùng `API_PREFIX`, nhập dạng `http://127.0.0.1:5005/prefix/v1`. Dùng HTTPS khi kết nối server từ xa.
+4. Ô API key: nhập `AUTHORIZATION` đã cấu hình trên server có token tài khoản được nạp, hoặc AccessToken/RefreshToken tài khoản ChatGPT. Đây không phải mật khẩu ChatGPT.
+5. Nhập tên model server/tài khoản hỗ trợ; mặc định tool dùng `gpt-4o`. Bấm **Lưu**, rồi **Kiểm tra** để thử dịch một câu.
+6. Tạo video mới để dùng cấu hình này. Với video từng dịch trước đây, bật **Dịch lại từ đầu** khi tạo công việc mới để bỏ bản dịch trong bộ nhớ.
+
+CLI cũng đọc `DUB_AI_PROVIDER=chat2api`, `DUB_AI_KEY`, `DUB_AI_MODEL` và `DUB_AI_BASE_URL`; biến môi trường ưu tiên hơn cấu hình giao diện. Key/token được lưu trong `config.json` trên máy như các nhà cung cấp hiện có; không chia sẻ file này.
+
+chat2api được dùng cho sửa ASR, phân tích nhân vật/xưng hô, dịch và viết tiêu đề. Giọng đọc tiếp tục dùng bộ TTS bạn chọn; chat2api không cung cấp Gemini TTS. Khả năng hoạt động và chất lượng phụ thuộc server, model, quyền tài khoản và lời nhận dạng đầu vào. Việc có mã nguồn chat2api không tự tạo ra token hoặc quyền dùng model.
+
